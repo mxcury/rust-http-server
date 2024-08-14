@@ -3,6 +3,8 @@ use std::{
     thread,
 };
 
+use log::{error, info};
+
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: mpsc::Sender<Message>,
@@ -42,25 +44,31 @@ impl ThreadPool {
         F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
-        self.sender.send(Message::NewJob(job)).unwrap();
+        if let Err(e) = self.sender.send(Message::NewJob(job)) {
+            error!("Failed to send job to the thread pool: {}", e);
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        println!("Sending terminate message to all workers");
+        info!("Sending terminate message to all workers");
 
         for _ in &self.workers {
-            self.sender.send(Message::Terminate).unwrap();
+            if let Err(e) = self.sender.send(Message::Terminate) {
+                error!("Failed to send terminate message to worker: {}", e);
+            }
         }
 
-        println!("Shutting down all workers");
+        info!("Shutting down all workers");
 
         for worker in &mut self.workers {
-            println!("Shutting down worker {}", worker.id);
+            info!("Shutting down worker {}", worker.id);
 
             if let Some(thread) = worker.thread.take() {
-                thread.join().unwrap();
+                if let Err(e) = thread.join() {
+                    error!("Failed to join worker thread {}: {:?}", worker.id, e);
+                }
             }
         }
     }
@@ -78,11 +86,11 @@ impl Worker {
 
             match message {
                 Message::NewJob(job) => {
-                    println!("Worker {} got a new job; executing...", id);
+                    info!("Worker {} got a new job; executing...", id);
                     job();
                 }
                 Message::Terminate => {
-                    println!("Worker {} is terminating", id);
+                    info!("Worker {} is terminating", id);
                     break;
                 }
             }

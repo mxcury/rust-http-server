@@ -1,8 +1,10 @@
 use std::io::prelude::*;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::Arc;
 
 use firebase_rs::Firebase;
+use log::{debug, error, info, warn};
 use rust_http_server::ThreadPool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,48 +34,69 @@ struct Review {
 const FIREBASE_URL: &str =
     "https://rust-movie-project-default-rtdb.europe-west1.firebasedatabase.app/";
 
-#[tokio::main]
-async fn main() {
-    let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
+fn main() {
+    env_logger::init(); // Initialize the logger
 
+    let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
     let pool = ThreadPool::new(4);
+    info!("Server started on port 8080");
+
+    // Initialize a single Tokio runtime
+    let runtime = Arc::new(Runtime::new().unwrap());
 
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
-
-        pool.execute(|| {
-            handle_connection(stream);
-        });
+        match stream {
+            Ok(stream) => {
+                let runtime = Arc::clone(&runtime);
+                pool.execute(move || {
+                    if let Err(e) = handle_connection(stream, runtime) {
+                        error!("Connection handling failed: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to establish a connection: {}", e);
+            }
+        }
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(
+    mut stream: TcpStream,
+    runtime: Arc<Runtime>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = [0; 1024];
-    stream.read(&mut buffer).unwrap();
+    stream.read(&mut buffer)?;
+
     let request = String::from_utf8_lossy(&buffer[..]);
 
     let (method, path) = parse_request_line(&request);
+    info!("Received request: {} {}", method, path);
 
-    let response = Runtime::new().unwrap().block_on(async {
+    let response = runtime.block_on(async {
         match (method, path) {
-            ("GET", "/api/movies") => handle_get_movies().await,
-            ("POST", "/api/movies") => handle_post_movies(&request).await,
-            ("PUT", "/api/movies") => handle_put_movies(&request).await,
-            ("DELETE", "/api/movies") => handle_delete_movies(&request).await,
-            ("GET", "/api/actors") => handle_get_actors().await,
-            ("POST", "/api/actors") => handle_post_actors(&request).await,
-            ("PUT", "/api/actors") => handle_put_actors(&request).await,
-            ("DELETE", "/api/actors") => handle_delete_actors(&request).await,
-            ("GET", "/api/reviews") => handle_get_reviews().await,
-            ("POST", "/api/reviews") => handle_post_reviews(&request).await,
-            ("PUT", "/api/reviews") => handle_put_reviews(&request).await,
-            ("DELETE", "/api/reviews") => handle_delete_reviews(&request).await,
-            _ => handle_404(),
+            ("GET", "/api/movies") => handle_get("movies").await,
+            ("POST", "/api/movies") => handle_post("movies", &request).await,
+            ("PUT", "/api/movies") => handle_put("movies", &request).await,
+            ("DELETE", "/api/movies") => handle_delete("movies", &request).await,
+            ("GET", "/api/actors") => handle_get("actors").await,
+            ("POST", "/api/actors") => handle_post("actors", &request).await,
+            ("PUT", "/api/actors") => handle_put("actors", &request).await,
+            ("DELETE", "/api/actors") => handle_delete("actors", &request).await,
+            ("GET", "/api/reviews") => handle_get("reviews").await,
+            ("POST", "/api/reviews") => handle_post("reviews", &request).await,
+            ("PUT", "/api/reviews") => handle_put("reviews", &request).await,
+            ("DELETE", "/api/reviews") => handle_delete("reviews", &request).await,
+            _ => {
+                warn!("Unknown path: {}", path);
+                handle_404()
+            }
         }
     });
 
-    stream.write(response.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }
 
 fn parse_request_line(request: &str) -> (&str, &str) {
@@ -87,29 +110,7 @@ fn parse_request_line(request: &str) -> (&str, &str) {
     ("", "")
 }
 
-async fn handle_get_movies() -> String {
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let movies_result = firebase.at("movies").get::<serde_json::Value>().await;
-
-    let status_line;
-    let contents;
-
-    match movies_result {
-        Ok(movies) => {
-            if movies.is_null() {
-                status_line = "HTTP/1.0 200 OK";
-                contents = "[]".to_string(); // Return an empty list if no movies are found
-            } else {
-                status_line = "HTTP/1.0 200 OK";
-                contents = movies.to_string();
-            }
-        }
-        Err(_) => {
-            status_line = "HTTP/1.0 500 INTERNAL SERVER ERROR";
-            contents = "Failed to retrieve movies".to_string();
-        }
-    }
-
+fn format_response(status_line: &str, contents: &str) -> String {
     format!(
         "{}\r\nContent-Length: {}\r\n\r\n{}",
         status_line,
@@ -118,461 +119,169 @@ async fn handle_get_movies() -> String {
     )
 }
 
-async fn handle_post_movies(request: &str) -> String {
-    println!("Received POST request: {}", request);
+async fn firebase_request(
+    path: &str,
+    request_type: &str,
+    data: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let firebase = Firebase::new(FIREBASE_URL).map_err(|e| e.to_string())?;
+    debug!("Firebase request: {} {}", request_type, path);
 
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-
-    if let Some(body) = request.split("\r\n\r\n").nth(1) {
-        let sanitized_body = body.replace('\0', "").trim().to_string();
-
-        match serde_json::from_str::<Movie>(&sanitized_body) {
-            Ok(movie) => {
-                let movie_json = json!(movie);
-                let path = format!("movies/");
-                match firebase.at(&path).set(&movie_json).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 201 CREATED";
-                        let contents = "Movie created";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error setting movie in Firebase: {:?}", e);
-                    }
+    match request_type {
+        "GET" => firebase
+            .at(path)
+            .get::<serde_json::Value>()
+            .await
+            .map_err(|e| {
+                error!("Firebase GET request failed: {}", e);
+                e.to_string()
+            }),
+        "POST" => {
+            if let Some(data) = data {
+                if let Err(e) = firebase.at(path).set(data).await {
+                    error!("Firebase POST request failed: {}", e);
+                    return Err(e.to_string());
                 }
             }
-            Err(e) => {
-                println!("Failed to parse movie JSON: {:?}", e);
-            }
+            Ok(json!({"status": "created"}))
         }
-    } else {
-        println!("Failed to extract body from request");
-    }
-
-    handle_400()
-}
-
-async fn handle_put_movies(request: &str) -> String {
-    println!("Received PUT request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(movie_update) => {
-            if let Some(id) = movie_update.get("id").and_then(|id| id.as_str()) {
-                let path = format!("movies/{}", id);
-                match firebase.at(&path).update(&movie_update).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Movie updated";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error updating movie in Firebase: {:?}", e);
-                    }
+        "PUT" => {
+            if let Some(data) = data {
+                if let Err(e) = firebase.at(path).update(data).await {
+                    error!("Firebase PUT request failed: {}", e);
+                    return Err(e.to_string());
                 }
-            } else {
-                println!("Movie ID not provided in the request");
             }
+            Ok(json!({"status": "updated"}))
         }
-        Err(e) => {
-            println!("Failed to parse movie JSON: {:?}", e);
+        "DELETE" => {
+            if let Err(e) = firebase.at(path).delete().await {
+                error!("Firebase DELETE request failed: {}", e);
+                return Err(e.to_string());
+            }
+            Ok(json!({"status": "deleted"}))
+        }
+        _ => {
+            error!("Unsupported request type: {}", request_type);
+            Err("Unsupported request type".to_string())
         }
     }
-
-    handle_400()
 }
 
-async fn handle_delete_movies(request: &str) -> String {
-    println!("Received DELETE request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(movie) => {
-            if let Some(id) = movie.get("id").and_then(|id| id.as_str()) {
-                let path = format!("movies/{}", id);
-                match firebase.at(&path).delete().await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Movie deleted";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error deleting movie in Firebase: {:?}", e);
-                    }
-                }
+async fn handle_get(resource: &str) -> String {
+    match firebase_request(resource, "GET", None).await {
+        Ok(data) => {
+            let contents = if data.is_null() {
+                "[]".to_string()
             } else {
-                println!("Movie ID not provided in the request");
-            }
-        }
-        Err(e) => {
-            println!("Failed to parse movie JSON: {:?}", e);
-        }
-    }
-
-    handle_400()
-}
-
-async fn handle_get_actors() -> String {
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let actors_result = firebase.at("actors").get::<serde_json::Value>().await;
-
-    let status_line;
-    let contents;
-
-    match actors_result {
-        Ok(actors) => {
-            if actors.is_null() {
-                status_line = "HTTP/1.0 200 OK";
-                contents = "[]".to_string(); // Return an empty list if no actors are found
-            } else {
-                status_line = "HTTP/1.0 200 OK";
-                contents = actors.to_string();
-            }
+                data.to_string()
+            };
+            format_response("HTTP/1.0 200 OK", &contents)
         }
         Err(_) => {
-            status_line = "HTTP/1.0 500 INTERNAL SERVER ERROR";
-            contents = "Failed to retrieve actors".to_string();
+            error!("Failed to handle GET request for {}", resource);
+            format_response(
+                "HTTP/1.0 500 INTERNAL SERVER ERROR",
+                "Failed to retrieve data",
+            )
         }
     }
-
-    format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line,
-        contents.len(),
-        contents
-    )
 }
 
-async fn handle_post_actors(request: &str) -> String {
-    println!("Received POST request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-
+async fn handle_post(resource: &str, request: &str) -> String {
     if let Some(body) = request.split("\r\n\r\n").nth(1) {
         let sanitized_body = body.replace('\0', "").trim().to_string();
+        let path = format!("{}/", resource);
 
-        match serde_json::from_str::<Actor>(&sanitized_body) {
-            Ok(actor) => {
-                let actor_json = json!(actor);
-                let path = format!("actors/");
-                match firebase.at(&path).set(&actor_json).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 201 CREATED";
-                        let contents = "Actor created";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error setting actor in Firebase: {:?}", e);
-                    }
+        match serde_json::from_str::<serde_json::Value>(&sanitized_body) {
+            Ok(data) => match firebase_request(&path, "POST", Some(&data)).await {
+                Ok(_) => format_response("HTTP/1.0 201 CREATED", "Resource created"),
+                Err(_) => {
+                    error!("Failed to create resource in {}", resource);
+                    handle_500()
                 }
-            }
-            Err(e) => {
-                println!("Failed to parse actor JSON: {:?}", e);
+            },
+            Err(_) => {
+                warn!("Failed to parse POST request body");
+                handle_400()
             }
         }
     } else {
-        println!("Failed to extract body from request");
+        warn!("POST request missing body");
+        handle_400()
     }
-
-    handle_400()
 }
 
-async fn handle_put_actors(request: &str) -> String {
-    println!("Received PUT request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(actor_update) => {
-            if let Some(id) = actor_update.get("id").and_then(|id| id.as_str()) {
-                let path = format!("actors/{}", id);
-                match firebase.at(&path).update(&actor_update).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Actor updated";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error updating actor in Firebase: {:?}", e);
-                    }
-                }
-            } else {
-                println!("Actor ID not provided in the request");
-            }
-        }
-        Err(e) => {
-            println!("Failed to parse actor JSON: {:?}", e);
-        }
-    }
-
-    handle_400()
-}
-
-async fn handle_delete_actors(request: &str) -> String {
-    println!("Received DELETE request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(actor) => {
-            if let Some(id) = actor.get("id").and_then(|id| id.as_str()) {
-                let path = format!("actors/{}", id);
-                match firebase.at(&path).delete().await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Actor deleted";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error deleting actor in Firebase: {:?}", e);
-                    }
-                }
-            } else {
-                println!("Actor ID not provided in the request");
-            }
-        }
-        Err(e) => {
-            println!("Failed to parse actor JSON: {:?}", e);
-        }
-    }
-
-    handle_400()
-}
-
-async fn handle_get_reviews() -> String {
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let reviews_result = firebase.at("reviews").get::<serde_json::Value>().await;
-
-    let status_line;
-    let contents;
-
-    match reviews_result {
-        Ok(reviews) => {
-            if reviews.is_null() {
-                status_line = "HTTP/1.0 200 OK";
-                contents = "[]".to_string(); // Return an empty list if no reviews are found
-            } else {
-                status_line = "HTTP/1.0 200 OK";
-                contents = reviews.to_string();
-            }
-        }
-        Err(_) => {
-            status_line = "HTTP/1.0 500 INTERNAL SERVER ERROR";
-            contents = "Failed to retrieve reviews".to_string();
-        }
-    }
-
-    format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line,
-        contents.len(),
-        contents
-    )
-}
-
-async fn handle_post_reviews(request: &str) -> String {
-    println!("Received POST request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-
+async fn handle_put(resource: &str, request: &str) -> String {
     if let Some(body) = request.split("\r\n\r\n").nth(1) {
         let sanitized_body = body.replace('\0', "").trim().to_string();
 
-        match serde_json::from_str::<Review>(&sanitized_body) {
-            Ok(review) => {
-                let review_json = json!(review);
-                let path = format!("reviews/");
-                match firebase.at(&path).set(&review_json).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 201 CREATED";
-                        let contents = "Review created";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
+        match serde_json::from_str::<serde_json::Value>(&sanitized_body) {
+            Ok(data) => {
+                if let Some(id) = data.get("id").and_then(|id| id.as_str()) {
+                    let path = format!("{}/{}", resource, id);
+                    match firebase_request(&path, "PUT", Some(&data)).await {
+                        Ok(_) => format_response("HTTP/1.0 200 OK", "Resource updated"),
+                        Err(_) => {
+                            error!("Failed to update resource in {}", resource);
+                            handle_500()
+                        }
                     }
-                    Err(e) => {
-                        println!("Error setting review in Firebase: {:?}", e);
-                    }
+                } else {
+                    warn!("PUT request missing id");
+                    handle_400()
                 }
             }
-            Err(e) => {
-                println!("Failed to parse review JSON: {:?}", e);
+            Err(_) => {
+                warn!("Failed to parse PUT request body");
+                handle_400()
             }
         }
     } else {
-        println!("Failed to extract body from request");
+        warn!("PUT request missing body");
+        handle_400()
     }
-
-    handle_400()
 }
 
-async fn handle_put_reviews(request: &str) -> String {
-    println!("Received PUT request: {}", request);
+async fn handle_delete(resource: &str, request: &str) -> String {
+    if let Some(body) = request.split("\r\n\r\n").nth(1) {
+        let sanitized_body = body.replace('\0', "").trim().to_string();
 
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(review_update) => {
-            if let Some(id) = review_update.get("id").and_then(|id| id.as_str()) {
-                let path = format!("reviews/{}", id);
-                match firebase.at(&path).update(&review_update).await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Review updated";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
+        match serde_json::from_str::<serde_json::Value>(&sanitized_body) {
+            Ok(data) => {
+                if let Some(id) = data.get("id").and_then(|id| id.as_str()) {
+                    let path = format!("{}/{}", resource, id);
+                    match firebase_request(&path, "DELETE", None).await {
+                        Ok(_) => format_response("HTTP/1.0 200 OK", "Resource deleted"),
+                        Err(_) => {
+                            error!("Failed to delete resource in {}", resource);
+                            handle_500()
+                        }
                     }
-                    Err(e) => {
-                        println!("Error updating review in Firebase: {:?}", e);
-                    }
+                } else {
+                    warn!("DELETE request missing id");
+                    handle_400()
                 }
-            } else {
-                println!("Review ID not provided in the request");
+            }
+            Err(_) => {
+                warn!("Failed to parse DELETE request body");
+                handle_400()
             }
         }
-        Err(e) => {
-            println!("Failed to parse review JSON: {:?}", e);
-        }
+    } else {
+        warn!("DELETE request missing body");
+        handle_400()
     }
-
-    handle_400()
-}
-
-async fn handle_delete_reviews(request: &str) -> String {
-    println!("Received DELETE request: {}", request);
-
-    let firebase = Firebase::new(FIREBASE_URL).unwrap();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .replace('\0', "")
-        .trim()
-        .to_string();
-
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(review) => {
-            if let Some(id) = review.get("id").and_then(|id| id.as_str()) {
-                let path = format!("reviews/{}", id);
-                match firebase.at(&path).delete().await {
-                    Ok(_) => {
-                        let status_line = "HTTP/1.0 200 OK";
-                        let contents = "Review deleted";
-                        return format!(
-                            "{}\r\nContent-Length: {}\r\n\r\n{}",
-                            status_line,
-                            contents.len(),
-                            contents
-                        );
-                    }
-                    Err(e) => {
-                        println!("Error deleting review in Firebase: {:?}", e);
-                    }
-                }
-            } else {
-                println!("Review ID not provided in the request");
-            }
-        }
-        Err(e) => {
-            println!("Failed to parse review JSON: {:?}", e);
-        }
-    }
-
-    handle_400()
 }
 
 fn handle_400() -> String {
-    let status_line = "HTTP/1.0 400 BAD REQUEST";
-    let contents = "400 - Bad Request";
-    format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line,
-        contents.len(),
-        contents
-    )
+    format_response("HTTP/1.0 400 BAD REQUEST", "Invalid request")
 }
 
 fn handle_404() -> String {
-    let status_line = "HTTP/1.0 404 NOT FOUND";
-    let contents = "404 - Not Found";
-    format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line,
-        contents.len(),
-        contents
-    )
+    format_response("HTTP/1.0 404 NOT FOUND", "Resource not found")
+}
+
+fn handle_500() -> String {
+    format_response("HTTP/1.0 500 INTERNAL SERVER ERROR", "An error occurred")
 }
